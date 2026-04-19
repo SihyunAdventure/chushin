@@ -1,0 +1,213 @@
+openapi: 3.1.0
+info:
+  title: Chushin — 쿠팡 스킨케어 가성비 API
+  version: 0.3.0
+  description: |
+    쿠팡 뷰티 12개 스킨케어 카테고리의 상품을 ml당/g당 정규화된 가격
+    (`price_per_100`) 기준으로 검색. 카테고리 한글 별명 (선크림, 수분크림 등)
+    을 worker 가 자동 매핑. No auth.
+
+    v0.3: 할인 관련 필드/파라미터 (sort=discount, on_sale, discount_rate,
+    original_price, unit_price_text) 전부 제거. 쿠팡 정가 seller-editable
+    이라 할인 % 는 신뢰할 signal 이 아님.
+  license:
+    name: MIT
+    url: https://github.com/SihyunAdventure/chushin/blob/main/LICENSE
+
+servers:
+  - url: https://chushin.sihyun.workers.dev
+    description: Production Cloudflare Worker
+
+paths:
+  /v1/search:
+    get:
+      operationId: searchChushin
+      summary: 스킨케어 상품 가성비 검색
+      description: |
+        `category` 는 한글 별명도 가능 (예: `선크림`, `수분크림`). 콤마로 최대
+        3 카테고리. `sort=unit` 은 100ml/100g 정규화 가격 오름차순, `sort=price`
+        는 판매가 오름차순. 응답은 24h 캐시되지만 `observed_at`/`staleness_hours`
+        는 매 요청마다 재계산.
+      parameters:
+        - name: category
+          in: query
+          required: true
+          description: 카테고리 slug 또는 한글 별명. 콤마로 최대 3개.
+          schema:
+            type: string
+            example: moisture-cream
+        - name: min_price
+          in: query
+          required: false
+          description: 최소 판매가 (원)
+          schema:
+            type: integer
+            minimum: 0
+            example: 5000
+        - name: max_price
+          in: query
+          required: false
+          description: 최대 판매가 (원)
+          schema:
+            type: integer
+            minimum: 0
+            example: 30000
+        - name: rocket
+          in: query
+          required: false
+          description: 로켓배송 필터. true 면 로켓만, false 면 비로켓만.
+          schema:
+            type: boolean
+        - name: sort
+          in: query
+          required: false
+          description: 정렬 기준. unit=ml/g당 가격, price=판매가.
+          schema:
+            type: string
+            enum: [unit, price]
+            default: unit
+        - name: limit
+          in: query
+          required: false
+          description: 결과 개수 (1~20, 기본 10)
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 20
+            default: 10
+      responses:
+        "200":
+          description: 검색 성공
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SearchResponse"
+        "400":
+          description: 잘못된 파라미터 (unknown_category / invalid_param / unknown_param)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "429":
+          description: Rate limited
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          description: 업스트림 장애 (upstream_error / upstream_unconfigured)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /health:
+    get:
+      operationId: healthCheck
+      summary: 헬스체크
+      responses:
+        "200":
+          description: "ok"
+          content:
+            text/plain:
+              schema:
+                type: string
+                example: ok
+
+components:
+  schemas:
+    SearchResponse:
+      type: object
+      required: [query, results, observed_at, staleness_hours, warnings, meta]
+      properties:
+        query:
+          type: object
+          description: 정규화된 파라미터 echo
+          properties:
+            category: { type: array, items: { type: string } }
+            min_price: { type: integer, nullable: true }
+            max_price: { type: integer, nullable: true }
+            rocket: { type: boolean, nullable: true }
+            sort: { type: string, enum: [unit, price] }
+            limit: { type: integer }
+        results:
+          type: array
+          items:
+            $ref: "#/components/schemas/Product"
+        observed_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: 반환된 rows 중 최신 `last_crawled_at` (ISO-8601). 응답 시점 재계산.
+        staleness_hours:
+          type: number
+          nullable: true
+          description: observed_at 으로부터 경과 시간 (소수점 1자리)
+        warnings:
+          type: array
+          items: { type: string }
+          description: 결과 없음 / 데이터 노후 경고 메시지
+        meta:
+          type: object
+          properties:
+            categories_available: { type: array, items: { type: string } }
+            sort_mode: { type: string }
+            rate_limit: { type: string }
+
+    Product:
+      type: object
+      required: [name, collection, sale_price, price_per_100, unit_type, is_rocket, badges, link, last_crawled_at, rank_reason]
+      properties:
+        name: { type: string, description: 상품명 (sanitize 통과) }
+        collection: { type: string, description: 카테고리 slug }
+        sale_price: { type: integer, description: 판매가 (원) }
+        price_per_100:
+          type: integer
+          nullable: true
+          description: 100ml/100g 정규화 가격 (정수 원). unit_type 이 ml/g 아니면 null.
+        unit_type:
+          type: string
+          description: "ml | g | pc | pad | set | sheet | unknown"
+        is_rocket: { type: boolean }
+        badges:
+          type: array
+          items: { type: string }
+          description: 쿠팡 뱃지 (sanitize 통과, 최대 5개)
+        link: { type: string, format: uri, description: 쿠팡 상품 URL }
+        last_crawled_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: 해당 상품 크롤 시각 (ISO-8601)
+        rank_reason:
+          type: string
+          description: 순위 근거 한 줄 (예 "100ml당 최저가 (1,140원)")
+
+    ErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              enum:
+                - unknown_category
+                - invalid_param
+                - unknown_param
+                - rate_limited
+                - upstream_error
+                - upstream_unconfigured
+                - method_not_allowed
+                - not_found
+            message: { type: string }
+            field: { type: string, description: 문제 파라미터 (해당 시) }
+            suggestions:
+              type: array
+              items: { type: string }
+              description: unknown_category 에 대해 Levenshtein 추천 (비어있을 수 있음)
+            retry_after_sec:
+              type: integer
+              description: rate_limited 일 때
